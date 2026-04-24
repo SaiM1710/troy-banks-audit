@@ -1,18 +1,20 @@
-# Web Server (The Drop Zone)
-fastapi
-uvicorn
-python-multipart
-
-# Extraction Engine (PyMuPDF & OCR)
+# PDF Extraction
 pymupdf
-pytesseract
 pdf2image
-opencv-python
+pytesseract
+opencv-python-headless
+pillow
 numpy
 
-# AI Sanitizer (The LLM Layer)
-pydantic
-openai
+# Database
+# SQLite3 is built into Python — no package needed
 
-# Database (The Vault)
-sqlalchemy
+# MCP Server
+mcp
+
+# Pipeline Utilities
+python-dateutil
+
+# Upgrade to paid tier when ready (uncomment one)
+# groq
+# anthropic
