@@ -1,0 +1,18 @@
+# Web Server (The Drop Zone)
+fastapi
+uvicorn
+python-multipart
+
+# Extraction Engine (PyMuPDF & OCR)
+pymupdf
+pytesseract
+pdf2image
+opencv-python
+numpy
+
+# AI Sanitizer (The LLM Layer)
+pydantic
+openai
+
+# Database (The Vault)
+sqlalchemy
