@@ -2,21 +2,26 @@
 db_handler.py — saves extracted bill data into the Troy & Banks
 relational database.
 
-Schema this writes to:
+Schema this writes to (matches create_db.py exactly):
   Clients ──┬── Properties ──┬── Accounts ──┬── Bills ── Line_Items
   Vendors ─────────────────────┘                       │
-                                                        │
-                                                        └── Anomaly_Analysis
+                                                        └── Audit_Claims
 
-Each save resolves the full hierarchy (client → property → vendor →
-account) before inserting the bill, auto-creating any missing rows.
-Bills carry their own taxes_and_fees, service period dates, and
-tariff code so the anomaly detector can run charge-composition and
-weather-normalised analyses without joining to line items.
+CRITICAL CHECK constraints enforced by the database:
+  - Bills.utility_type   ∈ ('Electric', 'Gas', 'Unknown')
+  - Bills.usage_unit     ∈ ('kWh', 'Therms', 'Unknown')
+  - Bills.anomaly_status ∈ ('Unreviewed', 'Confirmed', 'Dismissed', 'Claimed')
+  - Vendors.vendor_type  ∈ ('Electric', 'Gas', 'Both', 'Other')
+  - Line_Items.category  ∈ (9 values listed in normalise_category)
 
-The line_items array on the extraction result gets exploded into the
-Line_Items table so the anomaly detector can compute per-category
-proportions (delivery_pct, supply_pct, demand_pct, taxes_pct).
+Any value outside these sets will be rejected with a CHECK constraint
+error. This module normalises incoming values into the constraint set
+before insert so the model's free-text outputs don't fail at the
+database layer.
+
+Note on usage_unit: the schema only accepts kWh / Therms / Unknown.
+Water bills (CF, CCF, gallons) WILL be rejected. If you need to save
+water bills, the schema needs to be expanded — this is a hard limit.
 """
 
 import re
@@ -51,9 +56,7 @@ def normalise_date(value: str | None) -> str | None:
 def parse_amount(value) -> float:
     """
     Parse anything that looks like money into a float.
-    Handles "$1,234.56", "(50.00)" for negatives, plain numbers,
-    and Python None. Returns 0.0 on garbage so the database insert
-    doesn't fail with NULL on a NOT NULL column.
+    Returns 0.0 on garbage so NOT NULL constraints don't fail.
     """
     if value is None:
         return 0.0
@@ -64,6 +67,134 @@ def parse_amount(value) -> float:
         return float(cleaned)
     except ValueError:
         return 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK constraint normalisers
+# ─────────────────────────────────────────────────────────────────────────────
+# These functions map free-text values from the extraction layer into the
+# exact set of values the database CHECK constraints will accept. Anything
+# unrecognised falls back to a safe default ('Unknown' / 'Other').
+
+def normalise_utility_type(value) -> str:
+    """
+    Bills.utility_type CHECK IN ('Electric', 'Gas', 'Unknown')
+
+    Maps various inputs to the constrained set:
+      - "Electric", "ELECTRIC", "electric"   → "Electric"
+      - "Gas", "Natural Gas", "gas"          → "Gas"
+      - water bills, unknown                 → "Unknown"
+
+    Note: "national_grid" routes to "Electric" since most National Grid
+    bills are predominantly electric. If you later differentiate by
+    bill content, this mapping should split into Electric vs Gas.
+    """
+    if not value:
+        return "Unknown"
+    v = str(value).lower().strip()
+    if "electric" in v or v in ("kwh", "national_grid"):
+        return "Electric"
+    if "gas" in v or "therm" in v:
+        return "Gas"
+    return "Unknown"
+
+
+def normalise_usage_unit(value) -> str:
+    """
+    Bills.usage_unit CHECK IN ('kWh', 'Therms', 'Unknown')
+
+    The database is stricter than the UI dropdown — water units like
+    CF, CCF, gallons are NOT accepted. Such bills become 'Unknown'
+    rather than failing the save outright.
+    """
+    if not value:
+        return "Unknown"
+    v = str(value).strip().lower()
+    if v == "kwh":
+        return "kWh"
+    if v in ("therm", "therms"):
+        return "Therms"
+    # CF, CCF, gallons, anything else → Unknown
+    return "Unknown"
+
+
+def normalise_vendor_type(utility_type: str) -> str:
+    """
+    Vendors.vendor_type CHECK IN ('Electric', 'Gas', 'Both', 'Other')
+
+    Derived from the bill's utility_type. We don't currently distinguish
+    'Both' (dual-service vendors like National Grid) — every bill comes
+    in as either Electric or Gas individually. The 'Both' value is
+    reserved for future use when vendor metadata is enriched (e.g.
+    detecting that the same vendor_id has bills with both utility_types).
+
+    Allowed values: 'Electric', 'Gas', 'Both', 'Other'.
+    """
+    if not utility_type:
+        return "Other"
+    v = str(utility_type).lower()
+    if "electric" in v:
+        return "Electric"
+    if "gas" in v:
+        return "Gas"
+    return "Other"
+
+
+# Line_Items.category CHECK constraint — 9 allowed values
+ALLOWED_CATEGORIES = {
+    "Fixed Monthly Charge",
+    "Delivery Charge",
+    "Supply Charge",
+    "Demand Charge",
+    "Taxes and Surcharges",
+    "Rider",
+    "Adjustment",
+    "Credit",
+    "Other",
+}
+
+
+def normalise_category(value) -> str:
+    """
+    Line_Items.category — one of 9 allowed values, else 'Other'.
+
+    The extraction layer (Ollama prompt) is told to return categories
+    matching this set, but as a safety net any unrecognised value gets
+    mapped to 'Other' so the insert doesn't fail on a CHECK constraint.
+
+    A few common misspellings are mapped explicitly.
+    """
+    if not value:
+        return "Other"
+    v = str(value).strip()
+    if v in ALLOWED_CATEGORIES:
+        return v
+
+    # Light fuzzy mapping for common variants
+    v_lower = v.lower()
+    mapping = {
+        "fixed monthly":          "Fixed Monthly Charge",
+        "customer charge":        "Fixed Monthly Charge",
+        "monthly charge":         "Fixed Monthly Charge",
+        "service charge":         "Fixed Monthly Charge",
+        "delivery":               "Delivery Charge",
+        "distribution":           "Delivery Charge",
+        "transmission":           "Delivery Charge",
+        "supply":                 "Supply Charge",
+        "generation":             "Supply Charge",
+        "energy":                 "Supply Charge",
+        "demand":                 "Demand Charge",
+        "tax":                    "Taxes and Surcharges",
+        "surcharge":              "Taxes and Surcharges",
+        "fee":                    "Taxes and Surcharges",
+        "rider":                  "Rider",
+        "adjustment":             "Adjustment",
+        "credit":                 "Credit",
+    }
+    for needle, target in mapping.items():
+        if needle in v_lower:
+            return target
+    return "Other"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +224,11 @@ def get_or_create_property(conn, client_id, fields):
     physical address share one property_id, even when arriving from
     different vendors (electric + gas at the same building).
     """
-    address = fields.get("service_address") or fields.get("address") or "Unknown Address"
+    address = (
+        fields.get("service_address")
+        or fields.get("address")
+        or "Unknown Address"
+    )
 
     cur = conn.cursor()
     cur.execute(
@@ -122,24 +257,20 @@ def get_or_create_property(conn, client_id, fields):
 
 def get_or_create_vendor(conn, vendor_name, utility_type):
     """
-    Find or create the vendor (utility company). The vendor_type
-    column has a CHECK constraint on Electric / Gas / Other, so we
-    map our internal utility_type strings into one of those.
+    Find or create the vendor (utility company). The vendor_type column
+    has a CHECK constraint on Electric / Gas / Both / Other, so we map
+    our internal utility_type strings into one of those.
     """
     if not vendor_name:
         vendor_name = "Unknown Vendor"
 
-    # Map internal utility_type strings to the vendor_type CHECK constraint
-    v_type = "Other"
-    if utility_type:
-        ut_lower = str(utility_type).lower()
-        if "electric" in ut_lower:
-            v_type = "Electric"
-        elif "gas" in ut_lower:
-            v_type = "Gas"
+    v_type = normalise_vendor_type(utility_type)
 
     cur = conn.cursor()
-    cur.execute("SELECT vendor_id FROM Vendors WHERE vendor_name = ?", (vendor_name,))
+    cur.execute(
+        "SELECT vendor_id FROM Vendors WHERE vendor_name = ?",
+        (vendor_name,)
+    )
     row = cur.fetchone()
     if row:
         return row[0]
@@ -154,15 +285,18 @@ def get_or_create_vendor(conn, vendor_name, utility_type):
 def get_or_create_account(conn, property_id, vendor_id, fields):
     """
     Find or create the account (one per meter at a property).
-    Account number is the natural key — duplicate account numbers
-    from the same vendor get unified into one account_id.
+    Account number is the natural key (UNIQUE constraint at the schema
+    level) — duplicate account numbers get unified into one account_id.
     """
     acc_num = fields.get("account_number")
     if not acc_num:
         return None
 
     cur = conn.cursor()
-    cur.execute("SELECT account_id FROM Accounts WHERE account_number = ?", (acc_num,))
+    cur.execute(
+        "SELECT account_id FROM Accounts WHERE account_number = ?",
+        (acc_num,)
+    )
     row = cur.fetchone()
     if row:
         return row[0]
@@ -192,21 +326,17 @@ def save_bill_to_db(result: dict,
 
     Returns True on success, False on duplicate or error.
 
-    The result dict is expected to have the shape produced by app1's
-    row_to_db_result() wrapper — i.e. fields under "extracted_fields"
-    and metadata at the top level.
+    Hierarchy auto-creation: client → property → vendor → account
+    each get created on first encounter. Subsequent bills from the
+    same source link to existing rows.
 
-    Hierarchy auto-creation: if this is the first bill from a particular
-    client/property/vendor/account, the parent rows are created on the
-    fly. Subsequent bills from the same source link to the existing rows.
+    Duplicate detection: enforced by (account_id, billing_date).
+    Trying to save the same bill twice returns False without raising.
 
-    Duplicate detection: enforced by (account_id, billing_date). Trying
-    to save the same bill twice returns False without raising.
-
-    Line items: if fields["line_items"] is a non-empty list, each entry
-    gets exploded into the Line_Items table. Categories should already
-    be normalised to one of: Delivery Charge, Supply Charge, Demand
-    Charge, Taxes and Surcharges, Other.
+    Constraint normalisation: all CHECK-constrained values
+    (utility_type, usage_unit, vendor_type, line_item.category) are
+    normalised before insert so free-text output from the model doesn't
+    fail at the database layer.
     """
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -230,13 +360,15 @@ def save_bill_to_db(result: dict,
             print("  ⚠ Failed: No account number found in extraction.")
             return False
 
-        # ── 2. Build the bill row ────────────────────────────────────────
+        # ── 2. Normalise constraint-bound values ─────────────────────────
+        utility_type = normalise_utility_type(fields.get("utility_type"))
+        usage_unit   = normalise_usage_unit(fields.get("usage_unit"))
+
         billing_date = normalise_date(
             fields.get("bill_date") or fields.get("billing_date")
         )
 
-        # Duplicate check before insert — clearer error message than
-        # waiting for a UNIQUE constraint violation
+        # ── 3. Duplicate check ───────────────────────────────────────────
         cur = conn.cursor()
         cur.execute(
             "SELECT bill_id FROM Bills "
@@ -250,20 +382,14 @@ def save_bill_to_db(result: dict,
             )
             return False
 
-        # taxes_and_fees can come either as a directly extracted field OR
-        # be derived by summing line items in the "Taxes and Surcharges"
-        # category. Prefer the explicit field if present.
-        taxes_value = fields.get("taxes_and_fees")
-        if taxes_value is None and fields.get("line_items"):
-            taxes_value = sum(
-                parse_amount(li.get("total_price"))
-                for li in fields["line_items"]
-                if li.get("category") == "Taxes and Surcharges"
-            )
-
+        # ── 4. Build the bill row ────────────────────────────────────────
+        # Note: taxes_and_fees is NOT a column on Bills — it's stored as
+        # a Line_Items row with category='Taxes and Surcharges'. If the
+        # extraction returned taxes_and_fees as a top-level field but
+        # didn't include a corresponding line item, we synthesise one.
         bill_data = {
             "account_id":           acc_id,
-            "utility_type":         fields.get("utility_type", "Unknown"),
+            "utility_type":         utility_type,
             "billing_date":         billing_date,
             "service_period_start": normalise_date(fields.get("service_period_start")),
             "service_period_end":   normalise_date(fields.get("service_period_end")),
@@ -276,13 +402,11 @@ def save_bill_to_db(result: dict,
                                         fields.get("usage_quantity")
                                         or fields.get("usage_volume")
                                     ),
-            "usage_unit":           fields.get("usage_unit") or "Unknown",
+            "usage_unit":           usage_unit,
             "demand_read":          parse_amount(fields.get("demand_read")),
             "demand_unit":          fields.get("demand_unit"),
             "rate_code":            fields.get("rate_code"),
             "tariff_code":          fields.get("tariff_code"),
-            # New top-level field — sum of all taxes/surcharges on this bill
-            "taxes_and_fees":       parse_amount(taxes_value),
             "is_anomaly_detected":  1 if fields.get("anomaly_reason") else 0,
             "anomaly_reason":       fields.get("anomaly_reason"),
             "anomaly_status":       "Unreviewed",
@@ -290,7 +414,7 @@ def save_bill_to_db(result: dict,
             "source_file":          result.get("source_file"),
         }
 
-        # ── 3. Insert the bill ───────────────────────────────────────────
+        # ── 5. Insert the bill ───────────────────────────────────────────
         cols         = ", ".join(bill_data.keys())
         placeholders = ", ".join("?" * len(bill_data))
         cur.execute(
@@ -299,25 +423,29 @@ def save_bill_to_db(result: dict,
         )
         bill_id = cur.lastrowid
 
-        # ── 4. Insert line items if present ──────────────────────────────
+        # ── 6. Insert line items if present ──────────────────────────────
         # Each line item has category, description, total_price.
-        # Categories are constrained at the extraction layer to one of
-        # Delivery Charge / Supply Charge / Demand Charge /
-        # Taxes and Surcharges / Other so the anomaly detector can
-        # compute proportions reliably.
+        # Categories are normalised to one of the 9 CHECK-allowed values.
+        # If the model returns a category we don't recognise, it falls
+        # back to 'Other' rather than failing the save.
         line_items = fields.get("line_items") or []
         line_item_count = 0
+        line_items_have_taxes = False
+
         for item in line_items:
             if not isinstance(item, dict):
                 continue
             try:
+                category = normalise_category(item.get("category"))
+                if category == "Taxes and Surcharges":
+                    line_items_have_taxes = True
                 cur.execute("""
                     INSERT INTO Line_Items (bill_id, category,
                                             description, total_price)
                     VALUES (?, ?, ?, ?)
                 """, (
                     bill_id,
-                    item.get("category", "Other"),
+                    category,
                     item.get("description"),
                     parse_amount(item.get("total_price")),
                 ))
@@ -325,9 +453,33 @@ def save_bill_to_db(result: dict,
             except sqlite3.Error as e:
                 print(f"  ⚠ Skipped malformed line item: {e}")
 
+        # If the extraction returned a top-level taxes_and_fees value but
+        # there's no Taxes line item, synthesise one. This keeps the
+        # anomaly detector's per-category sums consistent — taxes_pct
+        # is computed from Line_Items, so a "phantom" tax value at the
+        # bill level wouldn't be picked up otherwise.
+        taxes_value = parse_amount(fields.get("taxes_and_fees"))
+        if taxes_value > 0 and not line_items_have_taxes:
+            try:
+                cur.execute("""
+                    INSERT INTO Line_Items (bill_id, category,
+                                            description, total_price)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    bill_id,
+                    "Taxes and Surcharges",
+                    "Synthesised from taxes_and_fees field",
+                    taxes_value,
+                ))
+                line_item_count += 1
+            except sqlite3.Error as e:
+                print(f"  ⚠ Couldn't synthesise tax line item: {e}")
+
         conn.commit()
 
-        line_item_msg = f", {line_item_count} line item(s)" if line_item_count else ""
+        line_item_msg = (
+            f", {line_item_count} line item(s)" if line_item_count else ""
+        )
         print(
             f"  ✓ Saved bill_id={bill_id}  "
             f"account={fields.get('account_number')}  "

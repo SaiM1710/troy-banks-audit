@@ -46,7 +46,7 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 # MODEL_NAME = "qwen2.5vl:3b"
 MODEL_NAME = "llama3.1:latest"
 REQUEST_TIMEOUT = 120  # seconds
-DB_PATH = "troybanks_bills.db"
+DB_PATH = "troy_banks_relational.db"
 
 
 # ---------------------------------------------------------------------------
@@ -57,20 +57,30 @@ DB_PATH = "troybanks_bills.db"
 # is strong evidence. The bill type then constrains usage_unit so that
 # the model literally cannot return "kWh" on a water bill.
 
+# Schema-aligned units: the Bills table CHECK constraint allows ONLY
+# 'kWh', 'Therms', or 'Unknown'. Water units (CF, CCF, gallons) cannot
+# be saved to this database. We keep water in the bill type detection
+# so the UI shows it correctly, but the constrained unit set forces
+# the model to return either kWh, Therms, or Unknown — values the
+# database will accept.
+#
+# Note: 'Therms' is capitalised here because that's the exact form the
+# CHECK constraint requires. Returning 'therms' lowercase would fail.
 UNITS_BY_BILL_TYPE = {
-    "water":         ["CF", "CCF", "gallons"],
+    "water":         ["Unknown"],            # schema can't store CF/CCF/gallons
     "electric":      ["kWh"],
-    "gas":           ["therms", "CCF"],   # gas can be billed in either
-    "national_grid": ["kWh", "therms"],   # dual-service bill
-    "unknown":       ["CF", "CCF", "kWh", "therms", "gallons"],  # all options
+    "gas":           ["Therms"],
+    "national_grid": ["kWh", "Therms"],      # dual-service bill
+    "unknown":       ["kWh", "Therms", "Unknown"],
 }
 
 BILL_TYPE_DESCRIPTIONS = {
-    "water":         "WATER utility bill (units will be CF, CCF, or gallons)",
-    "electric":      "ELECTRIC utility bill (units will be kWh)",
-    "gas":           "NATURAL GAS utility bill (units will be therms or CCF)",
+    "water":         "WATER utility bill — note: this database doesn't store "
+                     "water units, so usage_unit will be 'Unknown'",
+    "electric":      "ELECTRIC utility bill (usage_unit will be kWh)",
+    "gas":           "NATURAL GAS utility bill (usage_unit will be Therms)",
     "national_grid": "National Grid bill — electric and/or gas service "
-                     "(units will be kWh or therms)",
+                     "(usage_unit will be kWh or Therms)",
     "unknown":       "utility bill (type could not be determined from header)",
 }
 
@@ -194,11 +204,18 @@ def build_schema(bill_type: str) -> dict:
                     "properties": {
                         "category": {
                             "type": "string",
+                            # These 9 values match the Line_Items.category
+                            # CHECK constraint in create_db.py exactly.
+                            # Any other value would fail the database insert.
                             "enum": [
+                                "Fixed Monthly Charge",
                                 "Delivery Charge",
                                 "Supply Charge",
                                 "Demand Charge",
                                 "Taxes and Surcharges",
+                                "Rider",
+                                "Adjustment",
+                                "Credit",
                                 "Other",
                             ],
                         },
@@ -299,15 +316,34 @@ FIELDS:
 
 - line_items (array): every charge line on the bill, categorised.
   Each item has THREE fields:
-    * category (string): exactly ONE of:
+    * category (string): exactly ONE of these 9 values:
+        "Fixed Monthly Charge"   — customer charge, basic monthly fee,
+                                   service charge, account charge
         "Delivery Charge"        — delivery, distribution, transmission
         "Supply Charge"          — supply, generation, energy commodity
         "Demand Charge"          — demand-related charges (kW peaks)
-        "Taxes and Surcharges"   — all taxes, regulatory fees, riders
-        "Other"                  — customer service fee, late fees, etc.
+        "Taxes and Surcharges"   — all taxes (sales, state, county),
+                                   regulatory surcharges, system benefits
+        "Rider"                  — explicit "rider" charges, decoupling
+                                   mechanism, transition rider
+        "Adjustment"             — bill adjustments, corrections
+        "Credit"                 — credits applied (negative amounts)
+        "Other"                  — late fees, anything that doesn't fit
     * description (string | null): the label text from the bill,
       e.g. "Distribution Demand Charge", "Energy First 250 kWh @ $0.0892"
     * total_price (number | null): the dollar amount, as a bare number.
+      Use negative numbers for credits.
+
+  Categorisation hints for the common labels:
+    "Customer Charge"             → Fixed Monthly Charge
+    "Distribution"                → Delivery Charge
+    "Energy First/Next N kWh @"   → Supply Charge
+    "Distribution Demand Charge"  → Demand Charge
+    "NYS Sales Tax", "County Tax" → Taxes and Surcharges
+    "System Benefits Charge"      → Taxes and Surcharges
+    "Revenue Decoupling"          → Rider
+    "Transition Charge"           → Rider
+    "Merchant Function Charge"    → Other
 
   IMPORTANT: the sum of all line item total_price values should equal
   amount_due (within a few cents for rounding). If you find significantly
@@ -781,10 +817,14 @@ if st.session_state.results:
         ),
         "usage_quantity": st.column_config.NumberColumn("Usage"),
         # Dropdown so the unit is always one of the canonical values —
-        # prevents "kwh" vs "kWh" inconsistency across rows
+        # restricted to the database CHECK constraint values to avoid
+        # save failures.  Bills.usage_unit accepts only kWh / Therms /
+        # Unknown, so water units (CF, CCF, gallons) cannot be saved.
+        # Auditors who upload water bills will see usage_unit = Unknown
+        # and the database will accept the row.
         "usage_unit":     st.column_config.SelectboxColumn(
             "Unit",
-            options=["kWh", "CF", "CCF", "therms", "gallons", None],
+            options=["kWh", "Therms", "Unknown", None],
         ),
     }
 
