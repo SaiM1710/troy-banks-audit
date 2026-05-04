@@ -174,23 +174,42 @@ def build_schema(bill_type: str) -> dict:
     }
 
 
+
+# def build_user_prompt(bill_text: str, bill_type: str) -> str:
+#     """
+#     Leaner version — the schema enum already constrains usage_unit at the
+#     output level so the prompt only needs a one-line bill type hint.
+#     """
+#     valid_units = UNITS_BY_BILL_TYPE.get(bill_type, UNITS_BY_BILL_TYPE["unknown"])
+#     units_str   = ", ".join(valid_units)
+
+#     return f"""Extract these fields from the utility bill text below.
+
+# This is a {bill_type} bill — usage_unit must be one of: {units_str}.
 def build_user_prompt(bill_text: str, bill_type: str) -> str:
-    """
-    Leaner version — the schema enum already constrains usage_unit at the
-    output level so the prompt only needs a one-line bill type hint.
-    """
     valid_units = UNITS_BY_BILL_TYPE.get(bill_type, UNITS_BY_BILL_TYPE["unknown"])
     units_str   = ", ".join(valid_units)
-
-    return f"""Extract these fields from the utility bill text below.
-
-This is a {bill_type} bill — usage_unit must be one of: {units_str}.
+    return f"""Extract utility bill data. This is a {bill_type} bill.
+    
+    FIELDS TO FIND:
+    - vendor_name: The utility company (e.g., ConEd, PG&E).
+    - client_name: The person or company being billed.
+    - address, city, state, zip_code: The SERVICE address (where the utility is used).
+    - account_number: Unique ID for the bill.
+    - billing_date, due_date: In YYYY-MM-DD.
+    - service_start, service_end: The period covered by this bill.
+    - total_amount: The final amount due ($).
+    - usage_volume: The numerical usage (e.g., 450).
+    - usage_unit: The unit (kWh, therms, etc).
+    - rate_code / tariff_code: Specific utility codes often found near the bill calculation section.
+    - anomaly_reason: If the bill mentions a "re-read", "estimated bill", or "adjusted charge", note it here.
 
 FIELDS:
 
 - provider_name (string | null): utility company name from header,
   exactly as printed e.g. "Con Edison", "National Grid".
 - customer_name (string | null): account holder's name as written.
+  Try to find the full name.
 - account_number (number | null): preserve exact format including hyphens. 
     account_number usually start with the letter and number like A-123456789 
     Or just number like this 48271-93041
@@ -293,6 +312,9 @@ def process_one_file(uploaded_file) -> dict:
             "meter_number":   fields.get("meter_number"),
             "usage_quantity": fields.get("usage_quantity"),
             "usage_unit":     fields.get("usage_unit"),
+            "service_period_start": fields.get("service_period_start"),
+            "service_period_end": fields.get('service_period_end'),
+            "industry": bill_type,
             "status":         "OK",
             "error":          None,
             "saved_to_db":    False,   # tracks whether user has saved this row
