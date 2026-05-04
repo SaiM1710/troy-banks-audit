@@ -12,7 +12,9 @@ CRITICAL CHECK constraints enforced by the database:
   - Bills.usage_unit     ∈ ('kWh', 'Therms', 'Unknown')
   - Bills.anomaly_status ∈ ('Unreviewed', 'Confirmed', 'Dismissed', 'Claimed')
   - Vendors.vendor_type  ∈ ('Electric', 'Gas', 'Both', 'Other')
-  - Line_Items.category  ∈ (9 values listed in normalise_category)
+  - Line_Items.category  ∈ (9 values — only 'Taxes and Surcharges' is
+                             written by this prototype, others reserved
+                             for future line-item extraction)
 
 Any value outside these sets will be rejected with a CHECK constraint
 error. This module normalises incoming values into the constraint set
@@ -22,6 +24,13 @@ database layer.
 Note on usage_unit: the schema only accepts kWh / Therms / Unknown.
 Water bills (CF, CCF, gallons) WILL be rejected. If you need to save
 water bills, the schema needs to be expanded — this is a hard limit.
+
+Note on line items: this prototype does NOT extract per-charge line
+items (delivery, supply, demand, etc) because that adds 3-5 seconds
+per bill and llama3.1 categorisation is inconsistent. The only
+Line_Items row written is a single 'Taxes and Surcharges' entry
+when taxes_and_fees is extracted. Bringing back full line item
+extraction is the next step for production-quality anomaly detection.
 """
 
 import re
@@ -140,61 +149,13 @@ def normalise_vendor_type(utility_type: str) -> str:
     return "Other"
 
 
-# Line_Items.category CHECK constraint — 9 allowed values
-ALLOWED_CATEGORIES = {
-    "Fixed Monthly Charge",
-    "Delivery Charge",
-    "Supply Charge",
-    "Demand Charge",
-    "Taxes and Surcharges",
-    "Rider",
-    "Adjustment",
-    "Credit",
-    "Other",
-}
-
-
-def normalise_category(value) -> str:
-    """
-    Line_Items.category — one of 9 allowed values, else 'Other'.
-
-    The extraction layer (Ollama prompt) is told to return categories
-    matching this set, but as a safety net any unrecognised value gets
-    mapped to 'Other' so the insert doesn't fail on a CHECK constraint.
-
-    A few common misspellings are mapped explicitly.
-    """
-    if not value:
-        return "Other"
-    v = str(value).strip()
-    if v in ALLOWED_CATEGORIES:
-        return v
-
-    # Light fuzzy mapping for common variants
-    v_lower = v.lower()
-    mapping = {
-        "fixed monthly":          "Fixed Monthly Charge",
-        "customer charge":        "Fixed Monthly Charge",
-        "monthly charge":         "Fixed Monthly Charge",
-        "service charge":         "Fixed Monthly Charge",
-        "delivery":               "Delivery Charge",
-        "distribution":           "Delivery Charge",
-        "transmission":           "Delivery Charge",
-        "supply":                 "Supply Charge",
-        "generation":             "Supply Charge",
-        "energy":                 "Supply Charge",
-        "demand":                 "Demand Charge",
-        "tax":                    "Taxes and Surcharges",
-        "surcharge":              "Taxes and Surcharges",
-        "fee":                    "Taxes and Surcharges",
-        "rider":                  "Rider",
-        "adjustment":             "Adjustment",
-        "credit":                 "Credit",
-    }
-    for needle, target in mapping.items():
-        if needle in v_lower:
-            return target
-    return "Other"
+# Note: normalise_category() and ALLOWED_CATEGORIES were removed when
+# line item extraction was disabled in the prototype. They lived here
+# to map free-text categories from the model into the database's CHECK
+# constraint set. The only Line_Items row this module now writes is
+# hardcoded to 'Taxes and Surcharges', so no normalisation is needed.
+# When line item extraction comes back, restore both from version
+# control or rebuild from the database CHECK constraint definition.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,9 +295,9 @@ def save_bill_to_db(result: dict,
     Trying to save the same bill twice returns False without raising.
 
     Constraint normalisation: all CHECK-constrained values
-    (utility_type, usage_unit, vendor_type, line_item.category) are
-    normalised before insert so free-text output from the model doesn't
-    fail at the database layer.
+    (utility_type, usage_unit, vendor_type) are normalised before insert
+    so free-text output from the model doesn't fail at the database
+    layer.
     """
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -423,43 +384,16 @@ def save_bill_to_db(result: dict,
         )
         bill_id = cur.lastrowid
 
-        # ── 6. Insert line items if present ──────────────────────────────
-        # Each line item has category, description, total_price.
-        # Categories are normalised to one of the 9 CHECK-allowed values.
-        # If the model returns a category we don't recognise, it falls
-        # back to 'Other' rather than failing the save.
-        line_items = fields.get("line_items") or []
+        # ── 6. Synthesise a tax line item if taxes_and_fees was extracted ─
+        # Line items as a structured array are not extracted in the
+        # prototype phase (too slow). But the Bills table doesn't have a
+        # taxes_and_fees column either — taxes go into Line_Items. So if
+        # the model returned a taxes_and_fees scalar, we write it as a
+        # single Line_Items row with category 'Taxes and Surcharges'.
+        # The anomaly detector can later compute taxes_pct from this row.
         line_item_count = 0
-        line_items_have_taxes = False
-
-        for item in line_items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                category = normalise_category(item.get("category"))
-                if category == "Taxes and Surcharges":
-                    line_items_have_taxes = True
-                cur.execute("""
-                    INSERT INTO Line_Items (bill_id, category,
-                                            description, total_price)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    bill_id,
-                    category,
-                    item.get("description"),
-                    parse_amount(item.get("total_price")),
-                ))
-                line_item_count += 1
-            except sqlite3.Error as e:
-                print(f"  ⚠ Skipped malformed line item: {e}")
-
-        # If the extraction returned a top-level taxes_and_fees value but
-        # there's no Taxes line item, synthesise one. This keeps the
-        # anomaly detector's per-category sums consistent — taxes_pct
-        # is computed from Line_Items, so a "phantom" tax value at the
-        # bill level wouldn't be picked up otherwise.
         taxes_value = parse_amount(fields.get("taxes_and_fees"))
-        if taxes_value > 0 and not line_items_have_taxes:
+        if taxes_value > 0:
             try:
                 cur.execute("""
                     INSERT INTO Line_Items (bill_id, category,
@@ -468,17 +402,17 @@ def save_bill_to_db(result: dict,
                 """, (
                     bill_id,
                     "Taxes and Surcharges",
-                    "Synthesised from taxes_and_fees field",
+                    "Sum of all tax line items on the bill",
                     taxes_value,
                 ))
-                line_item_count += 1
+                line_item_count = 1
             except sqlite3.Error as e:
-                print(f"  ⚠ Couldn't synthesise tax line item: {e}")
+                print(f"  ⚠ Couldn't write tax line item: {e}")
 
         conn.commit()
 
         line_item_msg = (
-            f", {line_item_count} line item(s)" if line_item_count else ""
+            f", taxes=${taxes_value:.2f}" if line_item_count else ""
         )
         print(
             f"  ✓ Saved bill_id={bill_id}  "

@@ -157,16 +157,16 @@ def build_schema(bill_type: str) -> dict:
     this bill type. Ollama enforces enum constraints at the structured-output
     level — the model literally cannot return an invalid unit value.
 
-    Schema covers 13 scalar fields plus a line_items array. The line_items
-    field is critical for the anomaly detector: it computes per-category
-    proportions (delivery_pct, supply_pct, demand_pct, taxes_pct) that
-    catch the highest-value audit findings — bills where the total looks
-    fine but a single charge component silently doubled.
+    Schema covers 13 scalar fields. taxes_and_fees is captured as a top-
+    level scalar (the sum of all tax/surcharge lines on the bill) which
+    is enough signal for basic anomaly checks.
 
-    line_items.category is enum-constrained to the 5 categories the
-    anomaly detector recognises. Forcing the model into these categories
-    at the schema level means the detector doesn't have to do fuzzy
-    string matching downstream.
+    Note: line_items extraction was removed for the prototype phase.
+    Generating an array of categorised charges adds 3-5 seconds per bill
+    and llama3.1 categorisation is inconsistent without per-utility
+    examples. If the anomaly detector later needs charge composition
+    (delivery_pct, supply_pct, demand_pct), bring line_items back as
+    a separate, slower extraction path applied only to selected bills.
     """
     valid_units = UNITS_BY_BILL_TYPE.get(bill_type, UNITS_BY_BILL_TYPE["unknown"])
 
@@ -178,15 +178,17 @@ def build_schema(bill_type: str) -> dict:
             "account_number":        {"type": ["string", "null"]},
             "bill_date":             {"type": ["string", "null"]},
             "due_date":              {"type": ["string", "null"]},
-            # New: explicit billing period (distinct from bill_date which
-            # is the issue date). Anomaly detector uses these for accurate
+            # Explicit billing period (distinct from bill_date which is
+            # the issue date). Anomaly detector uses these for accurate
             # weather HDD/CDD calculation matched to the actual usage period.
             "service_period_start":  {"type": ["string", "null"]},
             "service_period_end":    {"type": ["string", "null"]},
-            # New: tariff code / rate schedule, e.g. "SC-1", "GS-2"
+            # Tariff code / rate schedule, e.g. "SC-1", "GS-2"
             "tariff_code":           {"type": ["string", "null"]},
             "amount_due":            {"type": ["number", "null"]},
-            # New: sum of all tax-related charges as a single number
+            # Sum of all tax-related charges as a single number — captured
+            # as a scalar instead of a line_items breakdown to keep
+            # extraction fast.
             "taxes_and_fees":        {"type": ["number", "null"]},
             "usage_quantity":        {"type": ["number", "null"]},
             "usage_unit": {
@@ -194,37 +196,6 @@ def build_schema(bill_type: str) -> dict:
                 "enum": valid_units + [None],
             },
             "meter_number":          {"type": ["string", "null"]},
-            # New: each charge line on the bill, categorised. The sum of
-            # all line item total_price values should equal amount_due
-            # (within rounding tolerance).
-            "line_items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "category": {
-                            "type": "string",
-                            # These 9 values match the Line_Items.category
-                            # CHECK constraint in create_db.py exactly.
-                            # Any other value would fail the database insert.
-                            "enum": [
-                                "Fixed Monthly Charge",
-                                "Delivery Charge",
-                                "Supply Charge",
-                                "Demand Charge",
-                                "Taxes and Surcharges",
-                                "Rider",
-                                "Adjustment",
-                                "Credit",
-                                "Other",
-                            ],
-                        },
-                        "description": {"type": ["string", "null"]},
-                        "total_price": {"type": ["number", "null"]},
-                    },
-                    "required": ["category", "description", "total_price"],
-                },
-            },
         },
         "required": [
             "provider_name", "customer_name", "account_number",
@@ -233,7 +204,6 @@ def build_schema(bill_type: str) -> dict:
             "tariff_code",
             "amount_due", "taxes_and_fees",
             "usage_quantity", "usage_unit", "meter_number",
-            "line_items",
         ],
         "additionalProperties": False,
     }
@@ -242,17 +212,14 @@ def build_schema(bill_type: str) -> dict:
 def build_user_prompt(bill_text: str, bill_type: str) -> str:
     """
     Builds the prompt for Ollama. The schema enum already constrains
-    usage_unit and line_item.category at the output level so the prompt
-    can stay relatively lean — its job is to give the model field-by-field
-    extraction rules that aren't expressible in a JSON schema.
+    usage_unit at the output level so the prompt can stay relatively
+    lean — its job is to give the model field-by-field extraction
+    rules that aren't expressible in a JSON schema.
 
     Critical rules baked in:
       - service period dates are DISTINCT from bill_date (issue date)
       - taxes_and_fees is the SUM of all tax lines, not a single one
-      - line_items must categorise into the 5 fixed enum values
-      - line item totals should sum to amount_due (anomaly detector
-        relies on this — bills where the sum is off by more than a
-        few cents are themselves a math-audit finding)
+      - tariff_code is read verbatim, not inferred from customer type
     """
     valid_units = UNITS_BY_BILL_TYPE.get(bill_type, UNITS_BY_BILL_TYPE["unknown"])
     units_str   = ", ".join(valid_units)
@@ -267,7 +234,8 @@ FIELDS:
   exactly as printed e.g. "Con Edison", "National Grid".
 - customer_name (string | null): account holder's name as written.
 - account_number (string | null): preserve exact format including hyphens.
-
+    Look for "Account Number", "Acct No", or similar 
+    For example: Acct No: 48271-93041
 - bill_date (string | null): date bill was ISSUED, YYYY-MM-DD format.
   This is the date PRINTED ON the bill, NOT the service period.
   Labels: "Bill Date", "Statement Date", "Date Issued".
@@ -304,6 +272,8 @@ FIELDS:
   Tax $8.47 plus Erie County Tax $8.03), ADD them together and return
   the total (16.50). Return as a bare number. Return null only if no
   tax lines appear at all on the bill.
+  Also it is known as "Sale Tax"
+  For example: Sales Tax 3.0 % 0.92
 
 - usage_quantity (number | null): total usage this period, as a bare
   number with no unit attached. Look for the value near "Total Usage",
@@ -313,44 +283,6 @@ FIELDS:
 
 - meter_number (string | null): meter identifier as written.
   Do NOT confuse with meter readings (the previous/current values).
-
-- line_items (array): every charge line on the bill, categorised.
-  Each item has THREE fields:
-    * category (string): exactly ONE of these 9 values:
-        "Fixed Monthly Charge"   — customer charge, basic monthly fee,
-                                   service charge, account charge
-        "Delivery Charge"        — delivery, distribution, transmission
-        "Supply Charge"          — supply, generation, energy commodity
-        "Demand Charge"          — demand-related charges (kW peaks)
-        "Taxes and Surcharges"   — all taxes (sales, state, county),
-                                   regulatory surcharges, system benefits
-        "Rider"                  — explicit "rider" charges, decoupling
-                                   mechanism, transition rider
-        "Adjustment"             — bill adjustments, corrections
-        "Credit"                 — credits applied (negative amounts)
-        "Other"                  — late fees, anything that doesn't fit
-    * description (string | null): the label text from the bill,
-      e.g. "Distribution Demand Charge", "Energy First 250 kWh @ $0.0892"
-    * total_price (number | null): the dollar amount, as a bare number.
-      Use negative numbers for credits.
-
-  Categorisation hints for the common labels:
-    "Customer Charge"             → Fixed Monthly Charge
-    "Distribution"                → Delivery Charge
-    "Energy First/Next N kWh @"   → Supply Charge
-    "Distribution Demand Charge"  → Demand Charge
-    "NYS Sales Tax", "County Tax" → Taxes and Surcharges
-    "System Benefits Charge"      → Taxes and Surcharges
-    "Revenue Decoupling"          → Rider
-    "Transition Charge"           → Rider
-    "Merchant Function Charge"    → Other
-
-  IMPORTANT: the sum of all line item total_price values should equal
-  amount_due (within a few cents for rounding). If you find significantly
-  fewer line items than expected, look harder — there may be a charges
-  table you missed.
-
-  Return an empty array [] only if NO line items are visible on the bill.
 
 Reformat any literal date to YYYY-MM-DD. Do NOT invent values that
 aren't in the text. Use null for any field not visibly present.
@@ -415,7 +347,6 @@ def process_one_file(uploaded_file) -> dict:
 
     The row carries:
       - extracted scalar fields (provider, customer, dates, amounts)
-      - line_items list for the anomaly detector
       - status/error metadata for the UI
       - _bill_text, _file_bytes (underscore-prefixed = not exported to CSV)
     """
@@ -437,7 +368,6 @@ def process_one_file(uploaded_file) -> dict:
             "account_number":       fields.get("account_number"),
             "bill_date":            fields.get("bill_date"),
             "due_date":             fields.get("due_date"),
-            # New fields — passed through to the database save flow
             "service_period_start": fields.get("service_period_start"),
             "service_period_end":   fields.get("service_period_end"),
             "tariff_code":          fields.get("tariff_code"),
@@ -446,9 +376,6 @@ def process_one_file(uploaded_file) -> dict:
             "meter_number":         fields.get("meter_number"),
             "usage_quantity":       fields.get("usage_quantity"),
             "usage_unit":           fields.get("usage_unit"),
-            # Line items live as a list — preserved for db_handler to
-            # explode into the Line_Items table
-            "line_items":           fields.get("line_items") or [],
             "status":               "OK",
             "error":                None,
             "saved_to_db":          False,
@@ -473,7 +400,6 @@ def process_one_file(uploaded_file) -> dict:
             "meter_number":         None,
             "usage_quantity":       None,
             "usage_unit":           None,
-            "line_items":           [],
             "status":               "ERROR",
             "error":                str(e),
             "saved_to_db":          False,
@@ -497,22 +423,17 @@ def row_to_db_result(row: dict) -> dict:
     save_bill_to_db expects them inside an "extracted_fields" dict
     along with metadata about the extraction itself.
 
-    All 13 scalar extraction fields plus the line_items array are
-    threaded through. The extraction rate is computed only over
-    scalars — line_items has its own coverage signal (does the
-    sum match amount_due) which the anomaly detector evaluates
-    separately.
+    All 13 scalar extraction fields are threaded through. The extraction
+    rate is computed over the scalar fields that are reliably present on
+    most bills (excluding optional fields like tariff_code and
+    taxes_and_fees).
     """
-    # Map app1's internal field names to what save_bill_to_db expects.
-    # save_bill_to_db reads "amount_due" or "total_amount" as fallbacks,
-    # so we use amount_due here and let the handler do the lookup.
     extracted = {
         "provider_name":         row.get("provider_name"),
         "customer_name":         row.get("customer_name"),
         "account_number":        row.get("account_number"),
         "bill_date":             row.get("bill_date"),
         "due_date":              row.get("due_date"),
-        # New fields plumbed through to the database
         "service_period_start":  row.get("service_period_start"),
         "service_period_end":    row.get("service_period_end"),
         "tariff_code":           row.get("tariff_code"),
@@ -531,13 +452,11 @@ def row_to_db_result(row: dict) -> dict:
             "national_grid": "Electric",
             "unknown":  "Other",
         }.get(row.get("bill_type"), "Other"),
-        # Line items array — exploded into Line_Items table by save_bill_to_db
-        "line_items":            row.get("line_items") or [],
     }
 
-    # Compute extraction rate from scalar non-null fields. Line items
-    # don't count here — their own quality signal is whether their sum
-    # matches amount_due.
+    # Compute extraction rate from scalar fields that should appear on
+    # most bills. tariff_code and taxes_and_fees are excluded — they're
+    # legitimately absent on many bills and would unfairly drag the rate.
     SCALAR_FIELDS_FOR_RATE = [
         "provider_name", "customer_name", "account_number",
         "bill_date", "due_date",
@@ -550,8 +469,6 @@ def row_to_db_result(row: dict) -> dict:
     rate = f"{filled_fields * 100 // len(SCALAR_FIELDS_FOR_RATE)}%"
 
     # Flag any nulls in the rate-counted set as needing review.
-    # tariff_code and taxes_and_fees are excluded from this list because
-    # they may be legitimately absent on some bills.
     low_conf = [
         k for k in SCALAR_FIELDS_FOR_RATE if extracted.get(k) is None
     ]
@@ -737,8 +654,6 @@ if st.session_state.results:
 
     # Columns to show in the editor — order matters for readability.
     # Grouped: identity → dates → financial → usage → metadata.
-    # line_items is NOT in the table editor — it's an array, edited
-    # via the per-file expander instead.
     visible_cols = [
         "source_file", "bill_type",
         "provider_name", "customer_name",
@@ -1063,64 +978,6 @@ if st.session_state.results:
                     ],
                 })
                 st.table(fields_df)
-
-                # Show line items if present — this is what the anomaly
-                # detector uses to compute charge composition. A bill with
-                # no line items extracted means the model couldn't find
-                # the charges table; flag it gently so the auditor knows.
-                line_items = row.get("line_items") or []
-                if line_items:
-                    st.markdown(f"**Line items ({len(line_items)})**")
-
-                    # Compute the sum so the auditor can sanity-check
-                    # against amount_due. If they're far off, it's a
-                    # signal that the extraction missed line items.
-                    items_sum = sum(
-                        (li.get("total_price") or 0)
-                        for li in line_items
-                        if isinstance(li, dict)
-                    )
-
-                    line_items_df = pd.DataFrame([
-                        {
-                            "Category":     li.get("category", "—"),
-                            "Description":  li.get("description", "—"),
-                            "Total Price":  (
-                                f"${li['total_price']:.2f}"
-                                if li.get("total_price") is not None
-                                else "—"
-                            ),
-                        }
-                        for li in line_items
-                        if isinstance(li, dict)
-                    ])
-                    st.table(line_items_df)
-
-                    # Sanity check: do the line items sum to amount_due?
-                    if amount is not None and amount > 0:
-                        diff      = abs(items_sum - amount)
-                        threshold = max(2.0, amount * 0.02)  # 2% or $2
-                        if diff <= threshold:
-                            st.success(
-                                f"✓ Line items sum to ${items_sum:.2f}, "
-                                f"matches amount due ${amount:.2f} "
-                                f"(within tolerance)"
-                            )
-                        else:
-                            st.warning(
-                                f"⚠️ Line items sum to ${items_sum:.2f} "
-                                f"but amount due is ${amount:.2f} "
-                                f"(off by ${diff:.2f}). The extraction "
-                                f"may have missed line items — review "
-                                f"the original bill before saving."
-                            )
-                else:
-                    st.caption(
-                        "ℹ️ No line items extracted. The anomaly detector "
-                        "needs line items to compute charge composition. "
-                        "If the bill has a charges table, try re-extracting."
-                    )
-
 
                 # Per-bill save button — disabled if extraction failed
                 # or if this row has already been saved this session
