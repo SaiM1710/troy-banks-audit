@@ -159,6 +159,9 @@ def build_schema(bill_type: str) -> dict:
             "due_date":       {"type": ["string", "null"]},
             "amount_due":     {"type": ["number", "null"]},
             "usage_quantity": {"type": ["number", "null"]},
+            "service_period_start": {"type": ["date", "null"]},
+            "service_period_end": {"type": ["date", "null"]},
+            "tax": {"type": ["date", "null"]},
             "usage_unit": {
                 "type": ["string", "null"],
                 "enum": valid_units + [None],
@@ -196,8 +199,9 @@ def build_user_prompt(bill_text: str, bill_type: str) -> str:
     - client_name: The person or company being billed.
     - address, city, state, zip_code: The SERVICE address (where the utility is used).
     - account_number: Unique ID for the bill.
-    - billing_date, due_date: In YYYY-MM-DD.
+    - billing_date, due_date, service_start_date, service_end_date: In YYYY-MM-DD.
     - service_start, service_end: The period covered by this bill.
+    - tax: The total tax that exist on the bill.
     - total_amount: The final amount due ($).
     - usage_volume: The numerical usage (e.g., 450).
     - usage_unit: The unit (kWh, therms, etc).
@@ -215,6 +219,8 @@ FIELDS:
     Or just number like this 48271-93041
     The account_number is start with "Account Number", "Acct No", or similar.
 - bill_date (string | null): date bill was issued, YYYY-MM-DD format.
+- service_start_date (string | null): the date when the billing period start, YYYY-MM-DD format
+- service_end_date (string | null): the date when the billing period end, YYYY-MM-DD format
 - due_date (string | null): payment due date, YYYY-MM-DD. Labels: "PAY BY",
   "DUE DATE", "Please Pay By". If label and value are on different lines
   due to OCR layout, look 1-2 lines below the label for the date.
@@ -224,6 +230,9 @@ FIELDS:
     "TOTAL AMOUNT DUE", "Total amount due", "Amount Due", "AMOUNT DUE",
     "Balance Due", "Please Pay", "Current balance due", "Total Due",
     "Pay This Amount", "PAY THIS AMOUNT"
+- tax (number | decimal): looks for the tax in the extracted text
+    tax used to come like NY State Sales Tax (4.0%) $3.42
+    or tax could be local tax then tax amount.
 - usage_quantity (number | null)
   Look for value that near the "Total Usage" text
   Another case is the amount is near the Usage Unit.
@@ -314,6 +323,7 @@ def process_one_file(uploaded_file) -> dict:
             "usage_unit":     fields.get("usage_unit"),
             "service_period_start": fields.get("service_period_start"),
             "service_period_end": fields.get('service_period_end'),
+            "tax": fields.get("tax"),
             "industry": bill_type,
             "status":         "OK",
             "error":          None,
@@ -368,6 +378,9 @@ def row_to_db_result(row: dict) -> dict:
         "usage_quantity": row.get("usage_quantity"),
         "usage_unit":     row.get("usage_unit"),
         "meter_number":   row.get("meter_number"),
+        "service_period_start": row.get("service_period_start"),
+        "service_period_end": row.get("service_period_end"),
+        "tax": row.get("tax")
     }
 
     # Compute extraction rate from non-null fields — used for audit reporting
@@ -562,7 +575,7 @@ if st.session_state.results:
         "source_file", "bill_type", "provider_name", "customer_name",
         "bill_date", "due_date", "amount_due", "account_number",
         "meter_number", "usage_quantity", "usage_unit", "status",
-        "saved_to_db",
+        "saved_to_db"
     ]
 
     # Columns the auditor SHOULDN'T be able to edit:

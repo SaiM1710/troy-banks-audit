@@ -35,5 +35,21 @@ def show_vault():
     except Exception as e:
         print(f"Error reading database: {e}")
 
+def run_sql():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM Bills")
+    
+    # Grab all the data
+    rows = cursor.fetchall()
+    
+    conn.close()
+    
+    # Do something with it
+    for row in rows:
+        print(row)
+        
+    return rows
 if __name__ == "__main__":
-    show_vault()
+    run_sql()

@@ -86,7 +86,69 @@ def get_or_create_account(conn, property_id, vendor_id, fields):
         VALUES (?, ?, ?, ?, ?)
     """, (property_id, vendor_id, acc_num, fields.get("meter_number"), fields.get("rate_code")))
     return cur.lastrowid
+def get_or_create_bill(conn, account_id, fields):
+    """
+    Checks if a bill for this account and date already exists.
+    If not, creates the bill and inserts the tax as a line item.
+    """
+    # 1. Normalise the key identifier
+    billing_date = normalise_date(fields.get("billing_date") or fields.get("bill_date"))
+    
+    if not account_id or not billing_date:
+        return None
+    
+    cur = conn.cursor()
 
+    # 2. Duplicate Check
+    cur.execute(
+        "SELECT bill_id FROM Bills WHERE account_id = ? AND billing_date = ?", 
+        (account_id, billing_date)
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    # 3. Insert the Bill
+    # Note: service_period_start and service_period_end are included here
+    cur.execute("""
+        INSERT INTO Bills (
+            account_id, 
+            utility_type, 
+            billing_date, 
+            service_period_start, 
+            service_period_end, 
+            due_date,
+            total_amount, 
+            usage_volume, 
+            usage_unit,
+            audit_timestamp,
+            anomaly_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        account_id,
+        fields.get("utility_type", "Unknown"),
+        billing_date,
+        normalise_date(fields.get("service_period_start")),
+        normalise_date(fields.get("service_period_end")),
+        normalise_date(fields.get("due_date")),
+        parse_amount(fields.get("total_amount")),
+        parse_amount(fields.get("usage_volume")),
+        fields.get("usage_unit", "Unknown"),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Unreviewed"
+    ))
+    
+    bill_id = cur.lastrowid
+
+    # 4. Insert Tax into Line_Items (linked to the bill we just created)
+    tax_value = parse_amount(fields.get("tax"))
+    if tax_value != 0:
+        cur.execute("""
+            INSERT INTO Line_Items (bill_id, category, description, total_price)
+            VALUES (?, 'Taxes and Surcharges', 'Total Tax Calculated', ?)
+        """, (bill_id, tax_value))
+
+    return bill_id
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Save Function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,7 +164,7 @@ def save_bill_to_db(result: dict, db_path: str = "troy_banks_relational.db") -> 
         prop_id   = get_or_create_property(conn, client_id, fields)
         vendor_id = get_or_create_vendor(conn, fields.get("vendor_name") or fields.get("provider_name"), fields.get("utility_type"))
         acc_id    = get_or_create_account(conn, prop_id, vendor_id, fields)
-
+        bill_table = get_or_create_bill(conn, fields.get("service_period_start"), fields.get("service_period_end"), fields.get("tax"))
         if not acc_id:
             print("  ⚠ Failed: No account number found.")
             return False
@@ -121,8 +183,10 @@ def save_bill_to_db(result: dict, db_path: str = "troy_banks_relational.db") -> 
             "account_id":           acc_id,
             "utility_type":         fields.get("utility_type", "Unknown"),
             "billing_date":         billing_date,
-            "service_period_start": normalise_date(fields.get("service_period_start")),
-            "service_period_end":   normalise_date(fields.get("service_period_end")),
+            # "service_period_start": normalise_date(fields.get("service_period_start")),
+            # "service_period_end":   normalise_date(fields.get("service_period_end")),
+            "service_period_start": bill_table,
+            "service_period_end": bill_table,
             "due_date":             normalise_date(fields.get("due_date")),
             "total_amount":         parse_amount(fields.get("total_amount") or fields.get("amount_due")),
             "usage_volume":         parse_amount(fields.get("usage_quantity") or fields.get("usage_volume")),
