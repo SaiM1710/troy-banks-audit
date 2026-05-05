@@ -149,8 +149,8 @@ Both apps write to the same troybanks_bills.db file. Bills extracted via either 
 
 ### One time set-up
 1. Create database
-   * python3.14 create_db.py
-   * This creates troybanks_bills.db with all three tables.
+   * python3.14 schema.py
+   * This creates troy_banks_relational.db with all three tables.
 2. Add your Gemini API key (only needed for gemini_app.py):
    * In .env file at project root
    * GEMINI_API_KEY=your_key_here
@@ -191,14 +191,14 @@ All without writing SQL or touching the database directly.
 # 🗄️ Updating the field schema
 ### If you want to extract additional fields:
 
-* Add the field to BILL_SCHEMA in gemini_client.py
+* Add the field to BILL_SCHEMA in llm_parser.py
 * Add the field to the prompt in the same file
 * Add the field to ALL_FIELDS in validate_and_clean
 * Update save_bill_to_db in db_handler.py to handle the new field
 * Add a column to the bills table in create_db.py (existing databases need a migration via ALTER TABLE)
 
 # 🗄️ Backups
-The entire database is one file: troybanks_bills.db. Copy it to back up; restore by replacing the file. SQLite handles the rest.
+The entire database is one file: troy_banks_ralational.db. Copy it to back up; restore by replacing the file. SQLite handles the rest.
 
 # 🗄️ MCP Server
 Use claude as the Assistant for MCP server where the user can interact with the Database without knowing how to write SQL
