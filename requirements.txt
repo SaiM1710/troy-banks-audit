@@ -15,6 +15,15 @@ mcp
 # Pipeline Utilities
 python-dateutil
 
+# Data Science & Anomaly Detection
+scikit-learn
+pandas
+requests
+
+# UI
+streamlit
+pdfplumber
+
 # Upgrade to paid tier when ready (uncomment one)
 # groq
 # anthropic

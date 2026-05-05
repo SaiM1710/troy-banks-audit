@@ -351,6 +351,382 @@ def run_sql(query: str) -> str:
         return json.dumps(rows, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e)})
+    
+
+@mcp.tool()
+def get_anomaly_dashboard(client_name: str = "") -> str:
+    """
+    Get the anomaly dashboard grouped by client then severity.
+    Plain English findings ready for auditor review.
+    Optionally filter by client name.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    client_filter = ""
+    params = []
+    if client_name:
+        client_filter = "AND LOWER(c.client_name) LIKE LOWER(?)"
+        params.append(f'%{client_name}%')
+
+    clients = cursor.execute(f"""
+        SELECT DISTINCT c.client_name,
+               COUNT(aa.analysis_id) as findings,
+               SUM(aa.potential_recovery) as recovery
+        FROM Anomaly_Analysis aa
+        JOIN Bills b ON aa.bill_id = b.bill_id
+        JOIN Accounts a ON b.account_id = a.account_id
+        JOIN Properties p ON a.property_id = p.property_id
+        JOIN Clients c ON p.client_id = c.client_id
+        WHERE aa.reviewed = 0
+        {client_filter}
+        GROUP BY c.client_name
+        ORDER BY recovery DESC
+    """, params).fetchall()
+
+    if not clients:
+        return json.dumps({"message": "No unreviewed findings found."})
+
+    result = []
+    for client in clients:
+        cname = client['client_name']
+
+        findings = cursor.execute(f"""
+            SELECT
+                aa.analysis_id,
+                aa.severity,
+                aa.detection_layer,
+                aa.plain_english_reason,
+                aa.potential_recovery,
+                b.utility_type,
+                b.billing_date,
+                b.total_amount,
+                p.property_name,
+                v.vendor_name
+            FROM Anomaly_Analysis aa
+            JOIN Bills b ON aa.bill_id = b.bill_id
+            JOIN Accounts a ON b.account_id = a.account_id
+            JOIN Properties p ON a.property_id = p.property_id
+            JOIN Clients c ON p.client_id = c.client_id
+            JOIN Vendors v ON a.vendor_id = v.vendor_id
+            WHERE c.client_name = ?
+            AND aa.reviewed = 0
+            {client_filter}
+            ORDER BY
+                CASE aa.severity
+                    WHEN 'URGENT' THEN 1
+                    WHEN 'HIGH'   THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    WHEN 'LOW'    THEN 4
+                END,
+                aa.potential_recovery DESC
+        """, [cname] + params).fetchall()
+
+        result.append({
+            "client": cname,
+            "total_findings": client['findings'],
+            "potential_recovery": round(client['recovery'], 2),
+            "findings": [dict(f) for f in findings]
+        })
+
+    conn.close()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_recovery_summary() -> str:
+    """
+    Get total potential recovery summary across all clients.
+    Shows breakdown by client, by severity, and by detection method.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # By client
+    by_client = cursor.execute("""
+        SELECT c.client_name,
+               COUNT(aa.analysis_id) as findings,
+               SUM(aa.potential_recovery) as recovery,
+               SUM(CASE WHEN aa.severity = 'URGENT' THEN 1 ELSE 0 END) as urgent
+        FROM Anomaly_Analysis aa
+        JOIN Bills b ON aa.bill_id = b.bill_id
+        JOIN Accounts a ON b.account_id = a.account_id
+        JOIN Properties p ON a.property_id = p.property_id
+        JOIN Clients c ON p.client_id = c.client_id
+        WHERE aa.reviewed = 0
+        GROUP BY c.client_name
+        ORDER BY recovery DESC
+    """).fetchall()
+
+    # By layer
+    by_layer = cursor.execute("""
+        SELECT detection_layer,
+               COUNT(*) as findings,
+               SUM(potential_recovery) as recovery
+        FROM Anomaly_Analysis
+        WHERE reviewed = 0
+        GROUP BY detection_layer
+        ORDER BY recovery DESC
+    """).fetchall()
+
+    # Overall
+    overall = cursor.execute("""
+        SELECT COUNT(*) as total_findings,
+               SUM(potential_recovery) as total_recovery,
+               SUM(CASE WHEN severity='URGENT' THEN 1 ELSE 0 END) as urgent,
+               SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) as high
+        FROM Anomaly_Analysis
+        WHERE reviewed = 0
+    """).fetchone()
+
+    conn.close()
+
+    layer_labels = {
+        'MATH':     'Arithmetic errors (charges dont add up)',
+        'ML':       'Pattern anomalies (Random Forest detection)',
+        'COMBINED': 'Confirmed by both pattern analysis and weather data'
+    }
+
+    result = {
+        "summary": {
+            "total_findings":    overall['total_findings'],
+            "total_recovery":    round(overall['total_recovery'], 2),
+            "urgent_findings":   overall['urgent'],
+            "high_findings":     overall['high'],
+        },
+        "by_client": [
+            {
+                "client":   r['client_name'],
+                "findings": r['findings'],
+                "recovery": round(r['recovery'], 2),
+                "urgent":   r['urgent']
+            }
+            for r in by_client
+        ],
+        "by_detection_method": [
+            {
+                "method":      layer_labels.get(r['detection_layer'],
+                                                r['detection_layer']),
+                "findings":    r['findings'],
+                "recovery":    round(r['recovery'], 2)
+            }
+            for r in by_layer
+        ]
+    }
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def confirm_finding(analysis_id: int, notes: str = "") -> str:
+    """
+    Confirm an anomaly finding as a real billing error.
+    Creates an Audit_Claim automatically.
+    analysis_id: the finding ID shown in the dashboard.
+    notes: optional auditor notes about why this is confirmed.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        # Get the finding
+        finding = cursor.execute("""
+            SELECT aa.*, b.bill_id, b.account_id,
+                   b.utility_type, b.billing_date,
+                   c.client_name, p.property_name
+            FROM Anomaly_Analysis aa
+            JOIN Bills b ON aa.bill_id = b.bill_id
+            JOIN Accounts a ON b.account_id = a.account_id
+            JOIN Properties p ON a.property_id = p.property_id
+            JOIN Clients c ON p.client_id = c.client_id
+            WHERE aa.analysis_id = ?
+        """, (analysis_id,)).fetchone()
+
+        if not finding:
+            conn.close()
+            return json.dumps({"error": f"Finding {analysis_id} not found."})
+
+        # Mark as reviewed
+        cursor.execute(
+            "UPDATE Anomaly_Analysis SET reviewed = 1 WHERE analysis_id = ?",
+            (analysis_id,)
+        )
+
+        # Update bill anomaly status
+        cursor.execute(
+            "UPDATE Bills SET anomaly_status = 'Confirmed' WHERE bill_id = ?",
+            (finding['bill_id'],)
+        )
+
+        # Create audit claim
+        claim_reason = finding['plain_english_reason']
+        if notes:
+            claim_reason += f" Auditor note: {notes}"
+
+        cursor.execute("""
+            INSERT INTO Audit_Claims
+            (bill_id, claim_date, claim_reason, amount_disputed, status)
+            VALUES (?, ?, ?, ?, 'Open')
+        """, (
+            finding['bill_id'],
+            __import__('datetime').date.today().strftime("%Y-%m-%d"),
+            claim_reason,
+            finding['potential_recovery']
+        ))
+
+        claim_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        return json.dumps({
+            "success": True,
+            "message": (
+                f"Finding {analysis_id} confirmed for "
+                f"{finding['client_name']} — "
+                f"{finding['property_name']} — "
+                f"{finding['utility_type']} — "
+                f"{finding['billing_date'][:7]}. "
+                f"Audit claim #{claim_id} created. "
+                f"Amount disputed: ${finding['potential_recovery']:,.2f}. "
+                f"Status: Open."
+            ),
+            "claim_id": claim_id,
+            "amount_disputed": finding['potential_recovery']
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def dismiss_finding(analysis_id: int, reason: str = "") -> str:
+    """
+    Dismiss an anomaly finding as not a real billing error.
+    analysis_id: the finding ID shown in the dashboard.
+    reason: why this finding is being dismissed.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        finding = cursor.execute(
+            "SELECT * FROM Anomaly_Analysis WHERE analysis_id = ?",
+            (analysis_id,)
+        ).fetchone()
+
+        if not finding:
+            conn.close()
+            return json.dumps({"error": f"Finding {analysis_id} not found."})
+
+        cursor.execute(
+            "UPDATE Anomaly_Analysis SET reviewed = 1 WHERE analysis_id = ?",
+            (analysis_id,)
+        )
+        cursor.execute(
+            "UPDATE Bills SET anomaly_status = 'Dismissed' WHERE bill_id = ?",
+            (finding['bill_id'],)
+        )
+
+        conn.commit()
+        conn.close()
+
+        return json.dumps({
+            "success": True,
+            "message": (
+                f"Finding {analysis_id} dismissed. "
+                f"Reason: {reason if reason else 'No reason provided'}. "
+                f"Bill marked as reviewed."
+            )
+        })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_detection_insights() -> str:
+    """
+    Get data science insights from the anomaly detection.
+    Shows what types of errors are most common and which
+    clients and vendors have the most billing issues.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Most common finding types
+    by_type = cursor.execute("""
+        SELECT finding_type,
+               COUNT(*) as count,
+               SUM(potential_recovery) as recovery,
+               ROUND(AVG(potential_recovery), 2) as avg_recovery
+        FROM Anomaly_Analysis
+        GROUP BY finding_type
+        ORDER BY recovery DESC
+    """).fetchall()
+
+    # Most problematic vendors
+    by_vendor = cursor.execute("""
+        SELECT v.vendor_name,
+               COUNT(aa.analysis_id) as findings,
+               SUM(aa.potential_recovery) as recovery
+        FROM Anomaly_Analysis aa
+        JOIN Bills b ON aa.bill_id = b.bill_id
+        JOIN Accounts a ON b.account_id = a.account_id
+        JOIN Vendors v ON a.vendor_id = v.vendor_id
+        GROUP BY v.vendor_name
+        ORDER BY recovery DESC
+    """).fetchall()
+
+    # Electric vs Gas breakdown
+    by_utility = cursor.execute("""
+        SELECT b.utility_type,
+               COUNT(aa.analysis_id) as findings,
+               SUM(aa.potential_recovery) as recovery
+        FROM Anomaly_Analysis aa
+        JOIN Bills b ON aa.bill_id = b.bill_id
+        GROUP BY b.utility_type
+    """).fetchall()
+
+    finding_labels = {
+        'MATH_ERROR':              'Arithmetic errors — charges do not add up',
+        'WEATHER_UNEXPLAINED_SPIKE': 'High usage not explained by weather',
+        'WEATHER_UNEXPLAINED_DROP':  'Unusually low usage despite extreme weather',
+        'WEATHER_DRIVEN':          'Weather-driven usage spike',
+        'USAGE_SPIKE':             'Abnormally high bill vs account history',
+        'USAGE_DROP':              'Abnormally low bill vs account history',
+    }
+
+    conn.close()
+
+    return json.dumps({
+        "most_common_error_types": [
+            {
+                "error_type":    finding_labels.get(
+                                    r['finding_type'], r['finding_type']
+                                 ),
+                "count":         r['count'],
+                "total_recovery": round(r['recovery'], 2),
+                "avg_per_finding": r['avg_recovery']
+            }
+            for r in by_type
+        ],
+        "by_vendor": [
+            {
+                "vendor":   r['vendor_name'],
+                "findings": r['findings'],
+                "recovery": round(r['recovery'], 2)
+            }
+            for r in by_vendor
+        ],
+        "by_utility_type": [
+            {
+                "utility":  r['utility_type'],
+                "findings": r['findings'],
+                "recovery": round(r['recovery'], 2)
+            }
+            for r in by_utility
+        ]
+    }, indent=2)
 
 
 if __name__ == "__main__":
