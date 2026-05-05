@@ -6,6 +6,10 @@ opencv-python-headless
 pillow
 numpy
 
+# Python ML model
+scikit-learn
+
+
 # Database
 # SQLite3 is built into Python — no package needed
 
