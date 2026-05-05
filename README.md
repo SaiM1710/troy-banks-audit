@@ -200,5 +200,25 @@ All without writing SQL or touching the database directly.
 # 🗄️ Backups
 The entire database is one file: troybanks_bills.db. Copy it to back up; restore by replacing the file. SQLite handles the rest.
 
+# 🗄️ MCP Server
+Use claude as the Assistant for MCP server where the user can interact with the Database without knowing how to write SQL
+
+# 🔥 Anomaly Detection
+## After the user extract all the bills, they can perform Anomaly Detection to see if there is spike in the usage history. There are 3 layers of detection
+1. Math Audit
+   * Python independently adds up every charge and compares to the bill total. If they do not match — flagged instantly. No AI, no probability. Pure arithmetic.
+2. Random Forest ML
+   * Trained on historical billing data. Looks at 12 dimensions simultaneously — charge amounts, effective rates, demand ratios, seasonal patterns, and industry type.
+3. Weather Normalization
+   * Fetches real historical temperature data. Compares actual heating and cooling degree days against historical averages for that month and location.
+  
+## Example of Anomaly Detection
+<img width="2406" height="1198" alt="image" src="https://github.com/user-attachments/assets/27c41768-eccd-47f1-b660-40715f929624" />
+
+
+
+
+
+
 # 🧠 Acknowledgements
 Built as part of a University at Buffalo consulting project for Troy & Banks. Uses Google Gemini for cloud extraction, Meta's llama3.1 via Ollama for local extraction, and Tesseract for OCR.
