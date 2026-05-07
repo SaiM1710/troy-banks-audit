@@ -155,8 +155,8 @@ Both apps write to the same troybanks_bills.db file. Bills extracted via either 
 
 ### One time set-up
 1. Create database
-   * python3.14 create_db.py
-   * This creates troybanks_bills.db with all three tables.
+   * python3.14 schema.py
+   * This creates troy_bank_relational.db with all the tables.
 2. Add your Gemini API key (only needed for gemini_app.py):
    * In .env file at project root
    * GEMINI_API_KEY=your_key_here
@@ -165,13 +165,13 @@ Both apps write to the same troybanks_bills.db file. Bills extracted via either 
 3. Running the app
    * Local llama + OCR (recommend)
      1. ollama serve
-     2. python3.14 -m streamlit run OCR_Local_Model.py
+     2. python3.14 -m streamlit run main.py
 4. Gemini API path
    * python3.14 -m streamlit run gemini_app.py
   
 # 🚀 Typical Workflow
 
-1. Auditor opens OCR_Local_Model.py or gemini_app.py in a browser
+1. Auditor opens main.py or gemini_app.py in a browser
 2. Drops 10-30 utility bills into the upload area
 3. Clicks 🚀 Extract All Bills (each bill took 10s for local and 5s for Gemini)
 4. Reviews results — each bill expander shows the original on the left, extracted fields on the right
@@ -197,11 +197,21 @@ All without writing SQL or touching the database directly.
 # 🗄️ Updating the field schema
 ### If you want to extract additional fields:
 
-* Add the field to BILL_SCHEMA in gemini_client.py
+* Add the field to BILL_SCHEMA in main.py
 * Add the field to the prompt in the same file
 * Add the field to ALL_FIELDS in validate_and_clean
 * Update save_bill_to_db in db_handler.py to handle the new field
 * Add a column to the bills table in create_db.py (existing databases need a migration via ALTER TABLE)
+
+# 🛡️ Multi-layer Anomalies Detection
+1. Math Audit
+   * Python independently adds up every charge and compares to the bill total. If they do not match — flagged instantly. No AI, no probability. Pure arithmetic.
+
+2. Random Forest (Machine Learning)
+  * Trained on historical billing data. Looks at 12 dimensions simultaneously — charge amounts, effective rates, demand ratios, seasonal patterns, and industry type.
+3. Weather Normalization
+   * Fetches real historical temperature data. Compares actual heating and cooling degree days against historical averages for that month and location.
+
 
 # 🗄️ Backups
 The entire database is one file: troybanks_bills.db. Copy it to back up; restore by replacing the file. SQLite handles the rest.
