@@ -9,6 +9,8 @@ Auditors at Troy & Banks process hundreds of utility bills per month, extracting
 3. Review — verify extracted values against the original bill side-by-side, edit anything that's wrong
 4. Save — commit corrected data to a SQLite database with auto-managed customer and provider records
 5. Query — ask plain-English questions or run pre-built analytics over the bills database
+6. Anomaly Detection - using Machine Learning model to flag any anomoalies that exist.
+7. UI Dashboard - interactive dashboard that help non-technical user to interact with the data.
 
 The system is designed for auditors who aren't developers — every action is a button click, every error has a plain-English message, and corrections to extracted data can be made directly in the UI.
 
@@ -60,6 +62,10 @@ From unstructure format like invoices -> structure tables
 ## SQLite Database
 ### troybanks_bills.db
 ### (customers, bills, providers)
+
+## &darr;
+
+## Anomalies Detection using Machine Learning (Random Forest)
 
 # ⚡ Two Apps, One Database
 The project ships with two Streamlit apps that share the same database:
