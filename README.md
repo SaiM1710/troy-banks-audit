@@ -26,7 +26,7 @@ From unstructure format like invoices -> structure tables
   &darr;
 ------------------------------------------------
 ### gemini_app.py (Gemini path)
-### OCR_Local_Model.py (OCR + LLM)
+### llm_parser.py (OCR + LLM)
 
 ## &darr;
 
