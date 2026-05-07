@@ -165,13 +165,13 @@ Both apps write to the same troybanks_bills.db file. Bills extracted via either 
 3. Running the app
    * Local llama + OCR (recommend)
      1. ollama serve
-     2. python3.14 -m streamlit run main.py
+     2. python3.14 -m streamlit run llm_parser.py
 4. Gemini API path
    * python3.14 -m streamlit run gemini_app.py
   
 # 🚀 Typical Workflow
 
-1. Auditor opens main.py or gemini_app.py in a browser
+1. Auditor opens llm_parser.py or gemini_app.py in a browser
 2. Drops 10-30 utility bills into the upload area
 3. Clicks 🚀 Extract All Bills (each bill took 10s for local and 5s for Gemini)
 4. Reviews results — each bill expander shows the original on the left, extracted fields on the right
@@ -197,7 +197,7 @@ All without writing SQL or touching the database directly.
 # 🗄️ Updating the field schema
 ### If you want to extract additional fields:
 
-* Add the field to BILL_SCHEMA in main.py
+* Add the field to BILL_SCHEMA in llm_parser.py
 * Add the field to the prompt in the same file
 * Add the field to ALL_FIELDS in validate_and_clean
 * Update save_bill_to_db in db_handler.py to handle the new field
@@ -211,6 +211,13 @@ All without writing SQL or touching the database directly.
   * Trained on historical billing data. Looks at 12 dimensions simultaneously — charge amounts, effective rates, demand ratios, seasonal patterns, and industry type.
 3. Weather Normalization
    * Fetches real historical temperature data. Compares actual heating and cooling degree days against historical averages for that month and location.
+
+# 🚀 Start the System
+
+1. python3.14 -m streamlit run llm_parser.py
+2. Upload the bills for extraction.
+3. Anomalies Detection.
+4. UI Dashboard for reviews.
 
 
 # 🗄️ Backups
