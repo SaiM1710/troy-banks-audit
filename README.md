@@ -26,7 +26,24 @@ Everything runs locally. No client data leaves the machine.
 
 ---
 
-## Results
+## Feature
+
+1. Upload — drop in PDF, JPG, or PNG bills (single or batch)
+2. Extract — pull structured fields using either Gemini Vision or local OCR + LLM
+3. Review — verify extracted values against the original bill side-by-side, edit anything that's wrong
+4. Save — commit corrected data to a SQLite database with auto-managed customer and provider records
+5. Query — ask plain-English questions or run pre-built analytics over the bills database by using MCP Server
+6. Anomalies Detection - three layers of detection to identify anomaly
+
+## Extraction Result
+
+From unstructure format like invoices -> structure tables
+
+<img width="2216" height="1442" alt="image" src="https://github.com/user-attachments/assets/8fb08ac0-2a47-4d8c-b19b-d96de54216f5" />
+
+---
+
+## Audit Result
 
 | Metric | Value |
 |--------|-------|
