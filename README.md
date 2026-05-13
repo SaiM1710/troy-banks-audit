@@ -108,7 +108,7 @@ The three layers are independent — each catches errors the others miss.
 | Layer | Technology |
 |-------|-----------|
 | PDF extraction | PyMuPDF, Tesseract, OpenCV |
-| AI normalization | Ollama + qwen2.5-coder:7b (local) |
+| AI normalization | Ollama + lama3.1:latest (local) |
 | Machine learning | scikit-learn RandomForestClassifier |
 | Weather data | Open-Meteo historical archive API |
 | Database | SQLite3 with WAL mode |
